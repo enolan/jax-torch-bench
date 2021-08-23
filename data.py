@@ -4,11 +4,12 @@ import numpy.typing as npt
 from torchtext.data.utils import get_tokenizer
 from torchtext.datasets import WikiText2
 from torchtext.vocab import build_vocab_from_iterator, Vocab
+from typing import Any
 
 
 def get_train_data(
     seq_len: int,
-) -> tuple[npt.NDArray[np.int32], Vocab, Callable[[str], list[str]]]:
+) -> tuple[npt.NDArray[np.int32], Vocab, Any]:
     train_iter = WikiText2(split="train")
     tokenizer = get_tokenizer("basic_english")
     vocab = build_vocab_from_iterator(map(tokenizer, train_iter), specials=["<unk>"])

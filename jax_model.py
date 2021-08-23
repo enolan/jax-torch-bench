@@ -1,9 +1,9 @@
-import haiku as hk
-from haiku import LayerNorm, Linear, MultiHeadAttention
 import itertools
+import flax.linen as fnn
 import jax
-import jax.nn as nn
+import jax.nn as jnn
 import jax.numpy as jnp
+import numpy as np
 import numpy.typing as npt
 import optax
 from tqdm import trange, tqdm
@@ -12,168 +12,144 @@ from typing import Union
 from data import get_train_data
 from utils import ConfigurationError, ShapeError
 
-SEQ_LEN = 20
-D_MODEL = 2048
+SEQ_LEN = 128
+D_MODEL = 768
 
 seqs, vocab, tokenizer = get_train_data(SEQ_LEN)
 seqs = jnp.array(seqs)
 
 
-class TransformerLayer(hk.Module):
-    def __init__(
-        self,
-        d_model: int,
-        num_heads: int,
-        ff_dim: int,
-        dropout: float,
-        init_scale: float,
-        mask: jnp.ndarray,
-    ):
-        super().__init__()
-        if d_model % num_heads != 0:
-            raise ConfigurationError("d_model must be divisible by num_heads")
+class TransformerLayer(fnn.Module):
+    d_model: int
+    num_heads: int
+    ff_dim: int
+    dropout: float
 
-        self.dropout = dropout
-        self.mask = mask
-        self.mha = MultiHeadAttention(
-            num_heads, d_model // num_heads, w_init_scale=init_scale
-        )
-        self.layer_norm_1 = LayerNorm(
-            axis=2, create_scale=True, create_offset=True, name="layer_norm_1"
-        )
-        self.linear_1 = Linear(output_size=ff_dim, name="linear_1")
-        self.linear_2 = Linear(output_size=d_model, name="linear_2")
-        self.layer_norm_2 = LayerNorm(
-            axis=2, create_scale=True, create_offset=True, name="layer_norm_2"
-        )
+    def setup(self):
+        # if d_model % num_heads != 0:
+        #     raise ConfigurationError("d_model must be divisible by num_heads")
 
-    def __call__(self, embeds):
-        # TODO add type annotations once I figure out the deal with adding Jax
-        # arrays:
-        # https://stackoverflow.com/questions/68884215/why-does-mypy-think-adding-two-jax-arrays-returns-a-numpy-array
-        out_block_1 = self.layer_norm_1(
-            hk.dropout(
-                hk.next_rng_key(),
-                self.dropout,
-                self.mha(embeds, embeds, embeds, mask=self.mask),
-            )
+        self.mha = fnn.SelfAttention(
+            num_heads=self.num_heads,
+            qkv_features=self.d_model,
+            dropout_rate=self.dropout,
+            deterministic=False,
         )
+        self.layer_norm_1 = fnn.LayerNorm()
+        self.linear_1 = fnn.Dense(features=self.ff_dim)
+        self.linear_2 = fnn.Dense(features=self.d_model)
+        self.layer_norm_2 = fnn.LayerNorm()
+        self.dropout_layer = fnn.Dropout(self.dropout, deterministic=False)
+
+    def __call__(
+        self, embeds: npt.NDArray[np.float32], mask: npt.NDArray[np.float32]
+    ) -> npt.NDArray[np.float32]:
+        # "correct" type annotations for jax DeviceArrays are numpy ndarrays :<
+        out_block_1 = self.layer_norm_1(self.mha(embeds, mask=mask))
         in_block_2 = embeds + out_block_1
         out_block_2 = self.layer_norm_2(
-            hk.dropout(
-                hk.next_rng_key(),
-                self.dropout,
-                self.linear_2(nn.relu(self.linear_1(in_block_2))),
-            )
+            self.dropout_layer(self.linear_2(jnn.relu(self.linear_1(in_block_2))))
         )
         return in_block_2 + out_block_2
 
 
-class LM(hk.Module):
-    def __init__(
-        self,
-        vocab_size: int,
-        n_layers: int,
-        d_model: int,
-        num_heads: int,
-        ff_dim: int,
-        dropout: float,
-        max_len: int,
-    ):
-        super().__init__()
-        self.dropout = dropout
-        self.d_model = d_model
-        self.max_len = max_len
+class LM(fnn.Module):
+    vocab_size: int
+    n_layers: int
+    d_model: int
+    num_heads: int
+    ff_dim: int
+    dropout: float
+    max_len: int
 
-        causal_mask = jnp.tril(jnp.ones([max_len, max_len]))
-        # wait should this be lower or upper triangular? I'm cribbing from a
-        # Haiku example which uses lower...
-        # brief experiment says this is right: changing a later token doesn't
-        # change the output of an earlier one, but the opposite does change it.
-
-        self.word_embedding = hk.Embed(vocab_size, embed_dim=d_model)
-        self.transformer_layers = hk.Sequential(
-            [
-                TransformerLayer(
-                    d_model, num_heads, ff_dim, dropout, 2.0 / n_layers, causal_mask
-                )
-                for _ in range(n_layers)
-            ]
+    def setup(self):
+        self.word_embedding = fnn.Embed(
+            num_embeddings=self.vocab_size, features=self.d_model
         )
-        self.prob_decoder = hk.Linear(output_size=vocab_size)
+        self.transformer_layers = [
+            TransformerLayer(self.d_model, self.num_heads, self.ff_dim, self.dropout)
+            for _ in range(self.n_layers)
+        ]
+        self.prob_decoder = fnn.Dense(features=self.vocab_size)
+        self.positional_encoding = self.param(
+            "positional_encoding",
+            jnn.initializers.lecun_normal(),
+            (self.max_len, self.d_model),
+        )
+        self.dropout_layer = fnn.Dropout(self.dropout, deterministic=False)
 
     def __call__(self, text):
         "Run the model, returning unnormalized log probabilities."
-        if len(text.shape) != 2 or text.shape[1] != self.max_len:
+        if (
+            len(text.shape) != 2
+            or text.shape[1] != self.max_len
+            or text.dtype != jnp.int32
+        ):
             raise ShapeError(
-                f"input text shape should be [batch, {self.max_len}] with dtype int. Got {text.shape}"
+                f"input text shape should be [batch, {self.max_len}] with dtype int. Got {text.shape}, {text.dtype}"
             )
-        print(f"text {text.shape}")
         input = self.word_embedding(text)
-        print(f"input {input.shape}")
+        mask = fnn.attention.make_causal_mask(text)
         # Shift input right so causality isn't violated
         input = jnp.concatenate(
             [jnp.zeros([text.shape[0], 1, self.d_model]), input[:, :-1, :]], axis=1
         )
-        input = input + hk.get_parameter(
-            "positional_encoding",
-            [self.max_len, self.d_model],
-            init=hk.initializers.TruncatedNormal(),
+        input = input + self.positional_encoding
+        input = self.dropout_layer(input)
+        for tl in self.transformer_layers:
+            input = tl(input, mask=mask)
+        return self.prob_decoder(input)
+
+    def sample(self, prompt: str, top_p: float = 0.95) -> str:
+        tokens = jnp.array(vocab(tokenizer(prompt)), dtype=int)[None, :]
+        prompt_tokens = tokens.shape[1]
+        tokens = jnp.concatenate(
+            [tokens, jnp.zeros([1, SEQ_LEN - prompt_tokens], dtype=int)], axis=1
         )
-        return self.prob_decoder(
-            self.transformer_layers(hk.dropout(hk.next_rng_key(), self.dropout, input))
-        )
+        rng = self.make_rng("token_sampling")
+        chosen_tokens = []
+        predict = jax.jit(self.__call__)
+        for i in range(prompt_tokens, SEQ_LEN):
+            unnorm_log_probs = predict(text=tokens)[0, i, :]
+            sorted_indices = jnp.argsort(unnorm_log_probs)[::-1]
+            cumulative_probs = jnp.cumsum(jnn.softmax(unnorm_log_probs[sorted_indices]))
+            sorted_indices_to_remove = cumulative_probs > top_p
+            inverse_permutation = np.empty_like(sorted_indices)
+            inverse_permutation[sorted_indices] = np.arange(sorted_indices.size)
+            indices_to_remove = np.nonzero(
+                sorted_indices_to_remove[inverse_permutation]
+            )
+            unnorm_log_probs = unnorm_log_probs.at[indices_to_remove].add(-1e30)
+            rng, rng2 = jax.random.split(rng)
+            chosen_token = jax.random.categorical(rng2, unnorm_log_probs)
+            chosen_tokens.append(chosen_token)
+            tokens = tokens.at[0, i].set(chosen_token)
+        return " ".join([vocab.lookup_token(tok) for tok in chosen_tokens])
 
 
-def compute_loss(params, eval_model, text, vocab_size, rng):
-    model_out = eval_model(rng=rng, params=params, text=text)
-    one_hots = nn.one_hot(text, vocab_size)
+def compute_loss(params, model, text, rng):
+    model_out = model.apply(params, text=text, rngs={"dropout": rng})
+    one_hots = jnn.one_hot(text, len(vocab))
     losses = optax.softmax_cross_entropy(model_out, one_hots)
     return losses.mean()
 
 
 def setup_model(rng):
-    def f():
-        model = LM(
-            vocab_size=len(vocab),
-            n_layers=8,
-            d_model=128,
-            num_heads=8,
-            ff_dim=2048,
-            dropout=0.1,
-            max_len=SEQ_LEN,
-        )
-
-        def eval_model(text):
-            return model(text)
-
-        def sample_from_model(prompt):
-            tokens = jnp.array(vocab(tokenizer(prompt)), dtype=int)[None, :]
-            prompt_tokens = tokens.shape[1]
-            tokens = jnp.concatenate(
-                [tokens, jnp.zeros([1, SEQ_LEN - prompt_tokens], dtype=int)], axis=1
-            )
-            chosen_tokens = []
-            for i in range(prompt_tokens, SEQ_LEN):
-                unnorm_log_probs = model(text=tokens)[0, i, :]
-                chosen_token = jax.random.categorical(
-                    hk.next_rng_key(), unnorm_log_probs
-                )
-                chosen_tokens.append(chosen_token)
-                tokens = tokens.at[0, i].set(chosen_token)
-            return chosen_tokens
-
-        def init(text):
-            return eval_model(text)
-
-        return init, (eval_model, sample_from_model)
-
-    f = hk.multi_transform(f)
-    return (
-        f.init(text=jnp.zeros([1, SEQ_LEN], dtype=int), rng=rng),
-        f.apply[0],
-        f.apply[1],
+    model = LM(
+        vocab_size=len(vocab),
+        n_layers=8,
+        d_model=D_MODEL,
+        num_heads=12,
+        ff_dim=3072,
+        dropout=0.1,
+        max_len=SEQ_LEN,
     )
+
+    rng_p, rng_d = jax.random.split(rng)
+    params = model.init(
+        {"params": rng_p, "dropout": rng_d}, jnp.zeros([1, SEQ_LEN], dtype=jnp.int32)
+    )
+    return params, model
 
 
 def setup_optimizer(params):
@@ -182,43 +158,51 @@ def setup_optimizer(params):
     return optimizer, opt_state
 
 
-def run_train_step(eval_model, optimizer, opt_state, params, rng, text):
+def run_train_step(model, optimizer, opt_state, params, text, rng):
     loss, grad = jax.value_and_grad(
-        lambda p: compute_loss(p, eval_model, text=text, vocab_size=len(vocab), rng=rng)
+        lambda p: compute_loss(p, model, text=text, rng=rng)
     )(params)
     updates, opt_state = optimizer.update(grad, opt_state)
     params = optax.apply_updates(params, updates)
     return params, opt_state, loss
 
 
-def train_loop(eval_model, optimizer, opt_state, params, batch_size, rng, n_iters=None):
-    n_iters = seqs.shape[0] // batch_size if n_iters is None else n_iters
-
+def train_loop(
+    model, optimizer, opt_state, params, batch_size, rng=None, n_epochs=None
+):
     fast_train_step = jax.jit(
-        run_train_step, static_argnames=["eval_model", "optimizer"]
+        run_train_step, static_argnames=["model", "optimizer"], donate_argnums=[2, 3]
     )
     # warm with dummy iter
     print("JITting...")
-    fast_train_step(
-        eval_model,
+    params, opt_state, _ = fast_train_step(
+        model,
         optimizer,
         opt_state,
         params,
-        rng,
         text=jnp.zeros([batch_size, SEQ_LEN], dtype=int),
+        rng=rng,
     )
 
     try:
         for epoch in itertools.count():
-            with trange(n_iters, leave=False) as pbar:
+            with trange(seqs.shape[0] // batch_size, leave=False) as pbar:
                 for i in pbar:
-                    rng, rng2 = jax.random.split(rng)
-
                     batch = seqs[i * batch_size : (i + 1) * batch_size, :]
+                    rng, rng2 = jax.random.split(rng)
                     params, opt_state, loss = fast_train_step(
-                        eval_model, optimizer, opt_state, params, rng2, text=batch
+                        model, optimizer, opt_state, params, text=batch, rng=rng2
                     )
                     pbar.set_postfix(loss=f"{loss:.4f}")
-            print(f"After epoch {epoch}, loss {loss:.4f}")
+                print(f"After epoch {epoch}, loss {loss:.4f}")
+                if epoch + 1 == n_epochs:
+                    return params, opt_state
     except KeyboardInterrupt:
         return params, opt_state
+    return params, opt_state
+
+
+def setup_all():
+    params, model = setup_model(jax.random.PRNGKey(11))
+    optimizer, opt_state = setup_optimizer(params)
+    return params, model, optimizer, opt_state
