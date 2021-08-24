@@ -6,17 +6,15 @@ import jax.numpy as jnp
 import numpy as np
 import numpy.typing as npt
 import optax
+import pickle
 from tqdm import trange, tqdm
 from typing import Union
 
-from data import get_train_data
+from data import Enwik9Loader
 from utils import ConfigurationError, ShapeError
 
-SEQ_LEN = 128
-D_MODEL = 768
-
-seqs, vocab, tokenizer = get_train_data(SEQ_LEN)
-seqs = jnp.array(seqs)
+SEQ_LEN = 256
+D_MODEL = 512
 
 
 class TransformerLayer(fnn.Module):
@@ -54,7 +52,6 @@ class TransformerLayer(fnn.Module):
 
 
 class LM(fnn.Module):
-    vocab_size: int
     n_layers: int
     d_model: int
     num_heads: int
@@ -63,14 +60,12 @@ class LM(fnn.Module):
     max_len: int
 
     def setup(self):
-        self.word_embedding = fnn.Embed(
-            num_embeddings=self.vocab_size, features=self.d_model
-        )
+        self.byte_embedding = fnn.Embed(num_embeddings=256, features=self.d_model)
         self.transformer_layers = [
             TransformerLayer(self.d_model, self.num_heads, self.ff_dim, self.dropout)
             for _ in range(self.n_layers)
         ]
-        self.prob_decoder = fnn.Dense(features=self.vocab_size)
+        self.prob_decoder = fnn.Dense(features=256)
         self.positional_encoding = self.param(
             "positional_encoding",
             jnn.initializers.lecun_normal(),
@@ -83,12 +78,12 @@ class LM(fnn.Module):
         if (
             len(text.shape) != 2
             or text.shape[1] != self.max_len
-            or text.dtype != jnp.int32
+            or text.dtype != jnp.uint8
         ):
             raise ShapeError(
-                f"input text shape should be [batch, {self.max_len}] with dtype int. Got {text.shape}, {text.dtype}"
+                f"input text shape should be [batch, {self.max_len}] with dtype uint8. Got {text.shape}, {text.dtype}"
             )
-        input = self.word_embedding(text)
+        input = self.byte_embedding(text)
         mask = fnn.attention.make_causal_mask(text)
         # Shift input right so causality isn't violated
         input = jnp.concatenate(
@@ -101,10 +96,12 @@ class LM(fnn.Module):
         return self.prob_decoder(input)
 
     def sample(self, prompt: str, top_p: float = 0.95) -> str:
-        tokens = jnp.array(vocab(tokenizer(prompt)), dtype=int)[None, :]
-        prompt_tokens = tokens.shape[1]
+        bytes_in = jnp.array(np.frombuffer(prompt.encode("utf-8"), dtype=np.uint8))[
+            None, :
+        ]
+        prompt_tokens = bytes_in.shape[1]
         tokens = jnp.concatenate(
-            [tokens, jnp.zeros([1, SEQ_LEN - prompt_tokens], dtype=int)], axis=1
+            [bytes_in, jnp.zeros([1, SEQ_LEN - prompt_tokens], dtype=jnp.uint8)], axis=1
         )
         rng = self.make_rng("token_sampling")
         chosen_tokens = []
@@ -119,27 +116,31 @@ class LM(fnn.Module):
             indices_to_remove = np.nonzero(
                 sorted_indices_to_remove[inverse_permutation]
             )
-            unnorm_log_probs = unnorm_log_probs.at[indices_to_remove].add(-1e30)
+            filtered_log_probs = unnorm_log_probs.at[indices_to_remove].add(-1e30)
+            # Always preserve the most likely token, in case it has > top_p
+            # probability on its own.
+            filtered_log_probs = filtered_log_probs.at[sorted_indices[0]].set(
+                unnorm_log_probs[sorted_indices[0]]
+            )
             rng, rng2 = jax.random.split(rng)
-            chosen_token = jax.random.categorical(rng2, unnorm_log_probs)
-            chosen_tokens.append(chosen_token)
+            chosen_token = jax.random.categorical(rng2, filtered_log_probs)
+            chosen_tokens.append(chosen_token.item())
             tokens = tokens.at[0, i].set(chosen_token)
-        return " ".join([vocab.lookup_token(tok) for tok in chosen_tokens])
+        return bytes(chosen_tokens).decode("utf-8")
 
 
 def compute_loss(params, model, text, rng):
     model_out = model.apply(params, text=text, rngs={"dropout": rng})
-    one_hots = jnn.one_hot(text, len(vocab))
+    one_hots = jnn.one_hot(text, 256)
     losses = optax.softmax_cross_entropy(model_out, one_hots)
     return losses.mean()
 
 
 def setup_model(rng):
     model = LM(
-        vocab_size=len(vocab),
-        n_layers=8,
+        n_layers=12,
         d_model=D_MODEL,
-        num_heads=12,
+        num_heads=8,
         ff_dim=3072,
         dropout=0.1,
         max_len=SEQ_LEN,
@@ -147,7 +148,7 @@ def setup_model(rng):
 
     rng_p, rng_d = jax.random.split(rng)
     params = model.init(
-        {"params": rng_p, "dropout": rng_d}, jnp.zeros([1, SEQ_LEN], dtype=jnp.int32)
+        {"params": rng_p, "dropout": rng_d}, jnp.zeros([1, SEQ_LEN], dtype=jnp.uint8)
     )
     return params, model
 
@@ -171,7 +172,7 @@ def train_loop(
     model, optimizer, opt_state, params, batch_size, rng=None, n_epochs=None
 ):
     fast_train_step = jax.jit(
-        run_train_step, static_argnames=["model", "optimizer"], donate_argnums=[2, 3]
+        run_train_step, static_argnames=["model", "optimizer"], donate_argnums=[2, 3, 4]
     )
     # warm with dummy iter
     print("JITting...")
@@ -180,20 +181,29 @@ def train_loop(
         optimizer,
         opt_state,
         params,
-        text=jnp.zeros([batch_size, SEQ_LEN], dtype=int),
+        text=jnp.zeros([batch_size, SEQ_LEN], dtype=jnp.uint8),
         rng=rng,
     )
 
     try:
         for epoch in itertools.count():
-            with trange(seqs.shape[0] // batch_size, leave=False) as pbar:
-                for i in pbar:
-                    batch = seqs[i * batch_size : (i + 1) * batch_size, :]
+            with tqdm(list(Enwik9Loader(batch_size, SEQ_LEN)), leave=False) as pbar:
+                ewma = {}
+                for idx, batch in enumerate(pbar):
                     rng, rng2 = jax.random.split(rng)
                     params, opt_state, loss = fast_train_step(
                         model, optimizer, opt_state, params, text=batch, rng=rng2
                     )
-                    pbar.set_postfix(loss=f"{loss:.4f}")
+                    smoothed_loss = update_ewma(ewma, 0.995, loss)
+                    pbar.set_postfix(
+                        loss=f"{loss:.4f}", smoothed_loss=f"{smoothed_loss:.4f}"
+                    )
+                    if idx % 1000 == 0:
+                        filename = f"model-{epoch:04d}-{idx:06d}.pkl"
+                        print(
+                            f"Saving model in {filename}, smoothed loss is {smoothed_loss:.4f}"
+                        )
+                        save_model(params, opt_state, filename)
                 print(f"After epoch {epoch}, loss {loss:.4f}")
                 if epoch + 1 == n_epochs:
                     return params, opt_state
@@ -206,3 +216,18 @@ def setup_all():
     params, model = setup_model(jax.random.PRNGKey(11))
     optimizer, opt_state = setup_optimizer(params)
     return params, model, optimizer, opt_state
+
+
+def save_model(params, opt_state, name):
+    with open(name, "wb") as f:
+        pickle.dump((params, opt_state), f)
+
+
+def update_ewma(ewma, smoothing_factor, new_value):
+    alpha = 1 - smoothing_factor
+    if "avg" in ewma:
+        new_avg = alpha * new_value + (1 - alpha) * ewma["avg"]
+    else:
+        new_avg = new_value
+    ewma["avg"] = new_avg
+    return new_avg

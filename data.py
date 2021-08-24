@@ -1,27 +1,32 @@
-from collections.abc import Callable
 import numpy as np
 import numpy.typing as npt
-from torchtext.data.utils import get_tokenizer
-from torchtext.datasets import WikiText2
-from torchtext.vocab import build_vocab_from_iterator, Vocab
+import random
 from typing import Any
 
 
-def get_train_data(
-    seq_len: int,
-) -> tuple[npt.NDArray[np.int32], Vocab, Any]:
-    train_iter = WikiText2(split="train")
-    tokenizer = get_tokenizer("basic_english")
-    vocab = build_vocab_from_iterator(map(tokenizer, train_iter), specials=["<unk>"])
-    vocab.set_default_index(vocab["<unk>"])
+class Enwik9Loader:
+    """Iterator that returns shuffled slices of Enwik9"""
 
-    train_iter = WikiText2(split="train")
-    lines_np = [np.array(vocab(tokenizer(item)), dtype=int) for item in train_iter]
-    all_text_np = np.concatenate(lines_np)
+    def __init__(self, batch_size: int, seq_len: int):
+        self.arr = np.fromfile("/home/enolan/junk/enwik9", dtype=np.uint8)
+        self.batch_size = batch_size
+        self.seq_len = seq_len
 
-    data_size = all_text_np.shape[0] // seq_len
-    all_text_np = all_text_np[: data_size * seq_len]
-
-    seqs = all_text_np.reshape(-1, seq_len)
-    print(f"sequences shape: {seqs.shape}")
-    return seqs, vocab, tokenizer
+    def __iter__(self):
+        # Make slice boundaries randomized across epochs
+        offset = random.randint(0, self.seq_len - 1)
+        offset_len = self.arr.size - offset
+        seqs = offset_len // self.seq_len
+        slices = np.array(
+            [
+                self.arr[start : start + self.seq_len]
+                for start in range(offset, offset + seqs * self.seq_len, self.seq_len)
+            ]
+        )
+        np.random.default_rng().shuffle(slices)
+        short_batch = len(slices) % self.batch_size
+        batches = [
+            slices[start : start + self.batch_size]
+            for start in range(0, len(slices) - short_batch, self.batch_size)
+        ]
+        return iter(batches)
