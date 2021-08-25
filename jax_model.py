@@ -76,19 +76,17 @@ class LM(fnn.Module):
     def __call__(self, text):
         "Run the model, returning unnormalized log probabilities."
         if (
-            len(text.shape) != 2
-            or text.shape[1] != self.max_len
+            len(text.shape) != 1
+            or text.shape[0] != self.max_len
             or text.dtype != jnp.uint8
         ):
             raise ShapeError(
-                f"input text shape should be [batch, {self.max_len}] with dtype uint8. Got {text.shape}, {text.dtype}"
+                f"input text shape should be [{self.max_len}] with dtype uint8. Got {text.shape}, {text.dtype}"
             )
         input = self.byte_embedding(text)
         mask = fnn.attention.make_causal_mask(text)
         # Shift input right so causality isn't violated
-        input = jnp.concatenate(
-            [jnp.zeros([text.shape[0], 1, self.d_model]), input[:, :-1, :]], axis=1
-        )
+        input = jnp.concatenate([jnp.zeros([1, self.d_model]), input[:-1, :]], axis=0)
         input = input + self.positional_encoding
         input = self.dropout_layer(input)
         for tl in self.transformer_layers:
@@ -96,18 +94,16 @@ class LM(fnn.Module):
         return self.prob_decoder(input)
 
     def sample(self, prompt: str, top_p: float = 0.95) -> str:
-        bytes_in = jnp.array(np.frombuffer(prompt.encode("utf-8"), dtype=np.uint8))[
-            None, :
-        ]
-        prompt_tokens = bytes_in.shape[1]
+        bytes_in = jnp.array(np.frombuffer(prompt.encode("utf-8"), dtype=np.uint8))
+        prompt_tokens = bytes_in.shape[0]
         tokens = jnp.concatenate(
-            [bytes_in, jnp.zeros([1, SEQ_LEN - prompt_tokens], dtype=jnp.uint8)], axis=1
+            [bytes_in, jnp.zeros([SEQ_LEN - prompt_tokens], dtype=jnp.uint8)], axis=0
         )
         rng = self.make_rng("token_sampling")
         chosen_tokens = []
         predict = jax.jit(self.__call__)
         for i in range(prompt_tokens, SEQ_LEN):
-            unnorm_log_probs = predict(text=tokens)[0, i, :]
+            unnorm_log_probs = predict(text=tokens)[i, :]
             sorted_indices = jnp.argsort(unnorm_log_probs)[::-1]
             cumulative_probs = jnp.cumsum(jnn.softmax(unnorm_log_probs[sorted_indices]))
             sorted_indices_to_remove = cumulative_probs > top_p
@@ -116,7 +112,7 @@ class LM(fnn.Module):
             indices_to_remove = np.nonzero(
                 sorted_indices_to_remove[inverse_permutation]
             )
-            filtered_log_probs = unnorm_log_probs.at[indices_to_remove].add(-1e30)
+            filtered_log_probs = unnorm_log_probs.at[indices_to_remove].set(-1e30)
             # Always preserve the most likely token, in case it has > top_p
             # probability on its own.
             filtered_log_probs = filtered_log_probs.at[sorted_indices[0]].set(
@@ -132,8 +128,8 @@ class LM(fnn.Module):
 def compute_loss(params, model, text, rng):
     model_out = model.apply(params, text=text, rngs={"dropout": rng})
     one_hots = jnn.one_hot(text, 256)
-    losses = optax.softmax_cross_entropy(model_out, one_hots)
-    return losses.mean()
+    loss = optax.softmax_cross_entropy(model_out, one_hots)
+    return loss
 
 
 def setup_model(rng):
@@ -148,7 +144,7 @@ def setup_model(rng):
 
     rng_p, rng_d = jax.random.split(rng)
     params = model.init(
-        {"params": rng_p, "dropout": rng_d}, jnp.zeros([1, SEQ_LEN], dtype=jnp.uint8)
+        {"params": rng_p, "dropout": rng_d}, jnp.zeros([SEQ_LEN], dtype=jnp.uint8)
     )
     return params, model
 
@@ -159,9 +155,13 @@ def setup_optimizer(params):
     return optimizer, opt_state
 
 
-def run_train_step(model, optimizer, opt_state, params, text, rng):
+def run_train_step(model, optimizer, opt_state, params, text_batch, rng):
     loss, grad = jax.value_and_grad(
-        lambda p: compute_loss(p, model, text=text, rng=rng)
+        lambda p: jax.vmap(
+            lambda text: compute_loss(p, model, text=text, rng=rng),
+            in_axes=0,
+            out_axes=0,
+        )(text_batch).mean()
     )(params)
     updates, opt_state = optimizer.update(grad, opt_state)
     params = optax.apply_updates(params, updates)
@@ -181,7 +181,7 @@ def train_loop(
         optimizer,
         opt_state,
         params,
-        text=jnp.zeros([batch_size, SEQ_LEN], dtype=jnp.uint8),
+        text_batch=jnp.zeros([batch_size, SEQ_LEN], dtype=jnp.uint8),
         rng=rng,
     )
 
