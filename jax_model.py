@@ -155,7 +155,6 @@ def setup_optimizer(params):
     return optimizer, opt_state
 
 
-@profile
 def train_loop(
     model, optimizer, opt_state, params, batch_size, rng=None, n_epochs=None
 ):
@@ -183,37 +182,14 @@ def train_loop(
     )
     print(" done.")
 
-    try:
-        #        for epoch in itertools.count():
-        ctr = 0
-        with tqdm(list(Enwik9Loader(batch_size, SEQ_LEN)), leave=True) as pbar:
-            ewma = {}
-            loss = None
-            for idx, batch in enumerate(pbar):
-                batch = jnp.array(batch)
-                # if loss is not None:
-                #     smoothed_loss = update_ewma(ewma, 0.995, loss)
-                #     pbar.set_postfix(
-                #         loss=f"{loss:.4f}", smoothed_loss=f"{smoothed_loss:.4f}"
-                #     )
-                # if idx % 1000 == 0 and idx > 0:
-                #     filename = f"model-{epoch:04d}-{idx:06d}.pkl"
-                #     print(
-                #         f"Saving model in {filename}, smoothed loss is {smoothed_loss:.4f}"
-                #     )
-                #     save_model(params, opt_state, filename)
-
-                params, opt_state, loss, rng = fast_train_step(
-                    opt_state, params, batch, rng
-                )
-                ctr += 1
-                if idx == 500:
-                    break
-            # print(f"After epoch {epoch}, loss {loss:.4f}")
-            # if epoch + 1 == n_epochs:
-            #     return params, opt_state
-    except KeyboardInterrupt:
-        return params, opt_state
+    with tqdm(list(Enwik9Loader(batch_size, SEQ_LEN)), leave=True) as pbar:
+        for idx, batch in enumerate(pbar):
+            batch = jnp.array(batch)
+            params, opt_state, loss, rng = fast_train_step(
+                opt_state, params, batch, rng
+            )
+            if idx == 500:
+                break
     return params, opt_state
 
 
