@@ -27,7 +27,10 @@ class TransformerLayer(fnn.Module):
         self.mha = fnn.SelfAttention(
             num_heads=self.num_heads,
             qkv_features=self.d_model,
-            dropout_rate=self.dropout,
+            # dropout in the attention matrix was introduced in
+            # https://arxiv.org/abs/1907.11065, it's *not* the normal thing
+            # from Attention is All You Need.
+            dropout_rate=0,
             deterministic=False,
         )
         self.layer_norm_1 = fnn.LayerNorm()
@@ -41,7 +44,7 @@ class TransformerLayer(fnn.Module):
     ) -> npt.NDArray[np.float32]:
         # "correct" type annotations for jax DeviceArrays are numpy ndarrays :<
         out_block_1 = self.layer_norm_1(self.mha(embeds, mask=mask))
-        in_block_2 = embeds + out_block_1
+        in_block_2 = embeds + self.dropout_layer(out_block_1)
         out_block_2 = self.layer_norm_2(
             self.dropout_layer(self.linear_2(jnn.relu(self.linear_1(in_block_2))))
         )
