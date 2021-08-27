@@ -171,7 +171,7 @@ def train_loop(
         params = optax.apply_updates(params, updates)
         return params, opt_state, loss, rng2
 
-    fast_train_step = jax.jit(run_train_step, donate_argnums=[0, 1])
+    fast_train_step = jax.jit(run_train_step, donate_argnums=[0, 1, 3])
     # warm with dummy iter
     print("JITting...", end="", flush=True)
     params, opt_state, loss, rng = fast_train_step(
