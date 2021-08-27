@@ -24,9 +24,6 @@ class TransformerLayer(fnn.Module):
     dropout: float
 
     def setup(self):
-        # if d_model % num_heads != 0:
-        #     raise ConfigurationError("d_model must be divisible by num_heads")
-
         self.mha = fnn.SelfAttention(
             num_heads=self.num_heads,
             qkv_features=self.d_model,
