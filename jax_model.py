@@ -155,60 +155,41 @@ def setup_optimizer(params):
     return optimizer, opt_state
 
 
-def run_train_step(model, optimizer, opt_state, params, text_batch, rng):
-    loss, grad = jax.value_and_grad(
-        lambda p: jax.vmap(
-            lambda text: compute_loss(p, model, text=text, rng=rng),
-            in_axes=0,
-            out_axes=0,
-        )(text_batch).mean()
-    )(params)
-    updates, opt_state = optimizer.update(grad, opt_state)
-    params = optax.apply_updates(params, updates)
-    return params, opt_state, loss
-
-
 def train_loop(
     model, optimizer, opt_state, params, batch_size, rng=None, n_epochs=None
 ):
-    fast_train_step = jax.jit(
-        run_train_step, static_argnames=["model", "optimizer"], donate_argnums=[2, 3, 4]
-    )
+    def run_train_step(opt_state, params, text_batch, rng):
+        rng, rng2 = jax.random.split(rng)
+        loss, grad = jax.value_and_grad(
+            lambda p: jax.vmap(
+                lambda text: compute_loss(p, model, text=text, rng=rng),
+                in_axes=0,
+                out_axes=0,
+            )(text_batch).mean()
+        )(params)
+        updates, opt_state = optimizer.update(grad, opt_state)
+        params = optax.apply_updates(params, updates)
+        return params, opt_state, loss, rng2
+
+    fast_train_step = jax.jit(run_train_step, donate_argnums=[0, 1])
     # warm with dummy iter
-    print("JITting...")
-    params, opt_state, _ = fast_train_step(
-        model,
-        optimizer,
+    print("JITting...", end="", flush=True)
+    params, opt_state, loss, rng = fast_train_step(
         opt_state,
         params,
-        text_batch=jnp.zeros([batch_size, SEQ_LEN], dtype=jnp.uint8),
-        rng=rng,
+        jnp.zeros([batch_size, SEQ_LEN], dtype=jnp.uint8),
+        rng,
     )
+    print(" done.")
 
-    try:
-        for epoch in itertools.count():
-            with tqdm(list(Enwik9Loader(batch_size, SEQ_LEN)), leave=False) as pbar:
-                ewma = {}
-                for idx, batch in enumerate(pbar):
-                    rng, rng2 = jax.random.split(rng)
-                    params, opt_state, loss = fast_train_step(
-                        model, optimizer, opt_state, params, text=batch, rng=rng2
-                    )
-                    smoothed_loss = update_ewma(ewma, 0.995, loss)
-                    pbar.set_postfix(
-                        loss=f"{loss:.4f}", smoothed_loss=f"{smoothed_loss:.4f}"
-                    )
-                    if idx % 1000 == 0:
-                        filename = f"model-{epoch:04d}-{idx:06d}.pkl"
-                        print(
-                            f"Saving model in {filename}, smoothed loss is {smoothed_loss:.4f}"
-                        )
-                        save_model(params, opt_state, filename)
-                print(f"After epoch {epoch}, loss {loss:.4f}")
-                if epoch + 1 == n_epochs:
-                    return params, opt_state
-    except KeyboardInterrupt:
-        return params, opt_state
+    with tqdm(list(Enwik9Loader(batch_size, SEQ_LEN)), leave=True) as pbar:
+        for idx, batch in enumerate(pbar):
+            batch = jnp.array(batch)
+            params, opt_state, loss, rng = fast_train_step(
+                opt_state, params, batch, rng
+            )
+            if idx == 500:
+                break
     return params, opt_state
 
 
@@ -231,3 +212,10 @@ def update_ewma(ewma, smoothing_factor, new_value):
         new_avg = new_value
     ewma["avg"] = new_avg
     return new_avg
+
+
+if __name__ == "__main__":
+    params, model, optimizer, opt_state = setup_all()
+    params, opt_state = train_loop(
+        model, optimizer, opt_state, params, 32, rng=jax.random.PRNGKey(0)
+    )
