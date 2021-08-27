@@ -11,7 +11,7 @@ from tqdm import trange, tqdm
 from typing import Union
 
 from data import Enwik9Loader
-from utils import ConfigurationError, ShapeError
+from utils import ConfigurationError, EWMA, ShapeError
 
 SEQ_LEN = 256
 D_MODEL = 512
@@ -182,14 +182,31 @@ def train_loop(
     )
     print(" done.")
 
-    with tqdm(list(Enwik9Loader(batch_size, SEQ_LEN)), leave=True) as pbar:
-        for idx, batch in enumerate(pbar):
-            batch = jnp.array(batch)
-            params, opt_state, loss, rng = fast_train_step(
-                opt_state, params, batch, rng
+    ewma = EWMA(smoothing_factor=0.99)
+    loss = None
+    try:
+        for epoch in itertools.count():
+            with tqdm(
+                list(Enwik9Loader(batch_size, SEQ_LEN))[:10], leave=False
+            ) as pbar:
+                with jax.profiler.trace("jaxprof"):
+                    for idx, batch in enumerate(pbar):
+                        with jax.profiler.TraceAnnotation("send_batch_to_gpu"):
+                            batch = jnp.array(batch)
+                        if loss is not None:
+                            smoothed_loss = ewma.update_ewma(loss)
+                            pbar.set_postfix(
+                                loss=f"{loss:.4f}", smoothed_loss=f"{smoothed_loss:.4f}"
+                            )
+                        params, opt_state, loss, rng = fast_train_step(
+                            opt_state, params, batch, rng
+                        )
+            print(
+                f"Epoch {epoch} complete, loss {loss:.4f}, smoothed loss {smoothed_loss:.4f}"
             )
-            if idx == 500:
-                break
+            break
+    except KeyboardInterrupt:
+        return params, opt_state
     return params, opt_state
 
 
@@ -202,16 +219,6 @@ def setup_all():
 def save_model(params, opt_state, name):
     with open(name, "wb") as f:
         pickle.dump((params, opt_state), f)
-
-
-def update_ewma(ewma, smoothing_factor, new_value):
-    alpha = 1 - smoothing_factor
-    if "avg" in ewma:
-        new_avg = alpha * new_value + (1 - alpha) * ewma["avg"]
-    else:
-        new_avg = new_value
-    ewma["avg"] = new_avg
-    return new_avg
 
 
 if __name__ == "__main__":
