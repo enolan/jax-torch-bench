@@ -187,9 +187,9 @@ def train_loop(
     try:
         for epoch in itertools.count():
             with tqdm(
-                list(Enwik9Loader(batch_size, SEQ_LEN))[:10], leave=False
+                list(Enwik9Loader(batch_size, SEQ_LEN)), leave=False
             ) as pbar:
-                with jax.profiler.trace("jaxprof"):
+#                with jax.profiler.trace("jaxprof"):
                     for idx, batch in enumerate(pbar):
                         with jax.profiler.TraceAnnotation("send_batch_to_gpu"):
                             batch = jnp.array(batch)
