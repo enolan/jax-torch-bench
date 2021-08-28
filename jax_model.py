@@ -186,21 +186,19 @@ def train_loop(
     loss = None
     try:
         for epoch in itertools.count():
-            with tqdm(
-                list(Enwik9Loader(batch_size, SEQ_LEN)), leave=False
-            ) as pbar:
-#                with jax.profiler.trace("jaxprof"):
-                    for idx, batch in enumerate(pbar):
-                        with jax.profiler.TraceAnnotation("send_batch_to_gpu"):
-                            batch = jnp.array(batch)
-                        if loss is not None:
-                            smoothed_loss = ewma.update_ewma(loss)
-                            pbar.set_postfix(
-                                loss=f"{loss:.4f}", smoothed_loss=f"{smoothed_loss:.4f}"
-                            )
-                        params, opt_state, loss, rng = fast_train_step(
-                            opt_state, params, batch, rng
+            with tqdm(list(Enwik9Loader(batch_size, SEQ_LEN)), leave=False) as pbar:
+                for idx, batch in enumerate(pbar):
+                    batch = jnp.array(batch)
+                    if loss is not None:
+                        smoothed_loss = ewma.update_ewma(loss)
+                        pbar.set_postfix(
+                            loss=f"{loss:.4f}", smoothed_loss=f"{smoothed_loss:.4f}"
                         )
+                        if idx % 1000 == 0:
+                            print(f"At step {idx}, smoothed loss {smoothed_loss:.4f}")
+                    params, opt_state, loss, rng = fast_train_step(
+                        opt_state, params, batch, rng
+                    )
             print(
                 f"Epoch {epoch} complete, loss {loss:.4f}, smoothed loss {smoothed_loss:.4f}"
             )
@@ -220,6 +218,9 @@ def save_model(params, opt_state, name):
     with open(name, "wb") as f:
         pickle.dump((params, opt_state), f)
 
+def load_model(name):
+    with open(name, "rb") as f:
+        return pickle.load(f)
 
 if __name__ == "__main__":
     params, model, optimizer, opt_state = setup_all()
