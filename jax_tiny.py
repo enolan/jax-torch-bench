@@ -60,13 +60,13 @@ def setup_bench(batch_size: int = 32):
     )(inputs)
     eval_fn_fast = jax.jit(eval_fn)
 
-    def compute_loss(params, rng, inputs):
-        model_out = eval_fn_fast(params, rng, inputs)
-        one_hots = jnn.one_hot(inputs, 256)
-        return optax.softmax_cross_entropy(model_out, one_hots).mean()
+    def compute_loss(params, rng, input):
+        model_out = tt.apply(params, input, rngs={"dropout": rng})
+        one_hots = jnn.one_hot(input, 256)
+        return optax.softmax_cross_entropy(model_out, one_hots)
 
     eval_and_grad_fn = lambda params, rng, batch: jax.value_and_grad(
-        lambda p: compute_loss(p, rng, batch)
+        lambda p: jax.vmap(lambda input: compute_loss(p, rng, input))(batch).mean()
     )(params)
     eval_and_grad_fast = jax.jit(eval_and_grad_fn)
 
@@ -259,3 +259,14 @@ def setup_bench(batch_size: int = 32):
 
 # jax.tree_map(lambda x: x.block_until_ready(), update_grad(params, opt_state, rng, inputs))
 # 252 ms ± 1.24 ms per loop (mean ± std. dev. of 7 runs, 1 loop each)
+
+# switch to vmap outside of softmax_cross_entropy + mean, rather than doing vmap inside eval and softmax_cross_entropy on batch
+
+# eval_fn(params, rng, inputs).block_until_ready()
+# 81 ms ± 145 µs per loop (mean ± std. dev. of 7 runs, 10 loops each)
+
+# jax.tree_map(lambda x: x.block_until_ready(), eval_and_grad_fn(params, rng, inputs))
+# 252 ms ± 1.31 ms per loop (mean ± std. dev. of 7 runs, 1 loop each)
+
+# jax.tree_map(lambda x: x.block_until_ready(), update_grad(params, opt_state, rng, inputs))
+# 256 ms ± 1.12 ms per loop (mean ± std. dev. of 7 runs, 1 loop each)
