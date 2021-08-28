@@ -121,8 +121,8 @@ class LM(fnn.Module):
             rng, rng2 = jax.random.split(rng)
             chosen_token = jax.random.categorical(rng2, filtered_log_probs)
             chosen_tokens.append(chosen_token.item())
-            tokens = tokens.at[0, i].set(chosen_token)
-        return bytes(chosen_tokens).decode("utf-8")
+            tokens = tokens.at[i].set(chosen_token)
+        return prompt + bytes(chosen_tokens).decode("utf-8")
 
 
 def compute_loss(params, model, text, rng):
