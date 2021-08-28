@@ -4,37 +4,47 @@ import jax.nn as jnn
 import jax.numpy as jnp
 import optax
 
+d_model = 512
+
+
+class TransformerLayer(fnn.Module):
+    def setup(self):
+        self.mha = fnn.SelfAttention(num_heads=8, qkv_features=d_model)
+        self.layer_norm_1 = fnn.LayerNorm()
+        self.linear_1 = fnn.Dense(features=3072)
+        self.linear_2 = fnn.Dense(features=d_model)
+        self.layer_norm_2 = fnn.LayerNorm()
+        self.dropout_layer = fnn.Dropout(0.1, deterministic=False)
+
+    def __call__(self, embeds, mask):
+        out_block_1 = self.layer_norm_1(self.mha(embeds, mask=mask))
+        in_block_2 = embeds + self.dropout_layer(out_block_1)
+        out_block_2 = self.layer_norm_2(
+            self.dropout_layer(self.linear_2(jnn.relu(self.linear_1(in_block_2))))
+        )
+        return in_block_2 + out_block_2
+
 
 class TransformerTiny(fnn.Module):
     def setup(self):
-        self.d_model = 512
 
-        self.embedding = fnn.Embed(num_embeddings=256, features=self.d_model)
+        self.embedding = fnn.Embed(num_embeddings=256, features=d_model)
         self.positional_encoding = self.param(
-            "positional_encoding", jnn.initializers.lecun_normal(), (256, self.d_model)
+            "positional_encoding", jnn.initializers.lecun_normal(), (256, d_model)
         )
-        self.mha = fnn.SelfAttention(num_heads=8, qkv_features=self.d_model)
-        self.layer_norm_1 = fnn.LayerNorm()
-        self.linear_1 = fnn.Dense(features=3072)
-        self.linear_2 = fnn.Dense(features=self.d_model)
-        self.layer_norm_2 = fnn.LayerNorm()
+        self.transformer_layers = [TransformerLayer() for _ in range(8)]
         self.prob_decoder = fnn.Dense(features=256)
         self.dropout_layer = fnn.Dropout(0.1, deterministic=False)
 
     def __call__(self, input):
         input_embed = self.embedding(input) + self.positional_encoding
-        print(f"input_embed {input_embed.shape}")
         input_embed = self.dropout_layer(
-            jnp.concatenate([jnp.zeros([1, self.d_model]), input_embed[:-1, :]], axis=0)
+            jnp.concatenate([jnp.zeros([1, d_model]), input_embed[:-1, :]], axis=0)
         )
-        out_block_1 = self.layer_norm_1(
-            self.mha(input_embed, mask=fnn.attention.make_causal_mask(input))
-        )
-        in_block_2 = input_embed + self.dropout_layer(out_block_1)
-        out_block_2 = self.layer_norm_2(
-            self.dropout_layer(self.linear_2(jnn.relu(self.linear_1(in_block_2))))
-        )
-        return self.prob_decoder(in_block_2 + out_block_2)
+        mask = fnn.attention.make_causal_mask(input)
+        for tl in self.transformer_layers:
+            input_embed = tl(input_embed, mask=mask)
+        return self.prob_decoder(input_embed)
 
 
 def setup_bench(batch_size: int = 32):
@@ -216,3 +226,36 @@ def setup_bench(batch_size: int = 32):
 
 # jax.tree_map(lambda x: x.block_until_ready(), update_grad(params, opt_state, rng, inputs))
 # 265 ms ± 1.1 ms per loop (mean ± std. dev. of 7 runs, 1 loop each)
+
+# list of 1 inner layer:
+
+# eval_fn(params, rng, inputs).block_until_ready()
+# 81.8 ms ± 182 µs per loop (mean ± std. dev. of 7 runs, 10 loops each)
+
+# jax.tree_map(lambda x: x.block_until_ready(), eval_and_grad_fn(params, rng, inputs))
+# 265 ms ± 1.53 ms per loop (mean ± std. dev. of 7 runs, 1 loop each)
+
+# jax.tree_map(lambda x: x.block_until_ready(), update_grad(params, opt_state, rng, inputs))
+# 265 ms ± 1.66 ms per loop (mean ± std. dev. of 7 runs, 1 loop each)
+
+# batch size down to 32:
+
+# eval_fn(params, rng, inputs).block_until_ready()
+# 10.6 ms ± 17.4 µs per loop (mean ± std. dev. of 7 runs, 100 loops each)
+
+# jax.tree_map(lambda x: x.block_until_ready(), eval_and_grad_fn(params, rng, inputs))
+# 32.5 ms ± 135 µs per loop (mean ± std. dev. of 7 runs, 10 loops each)
+
+# jax.tree_map(lambda x: x.block_until_ready(), update_grad(params, opt_state, rng, inputs))
+# 32.9 ms ± 126 µs per loop (mean ± std. dev. of 7 runs, 10 loops each)
+
+# list of 8 inner layers:
+
+# eval_fn(params, rng, inputs).block_until_ready()
+# 81.3 ms ± 204 µs per loop (mean ± std. dev. of 7 runs, 10 loops each)
+
+# jax.tree_map(lambda x: x.block_until_ready(), eval_and_grad_fn(params, rng, inputs))
+# 249 ms ± 1.51 ms per loop (mean ± std. dev. of 7 runs, 1 loop each)
+
+# jax.tree_map(lambda x: x.block_until_ready(), update_grad(params, opt_state, rng, inputs))
+# 252 ms ± 1.24 ms per loop (mean ± std. dev. of 7 runs, 1 loop each)
