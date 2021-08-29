@@ -226,7 +226,6 @@ def train_loop(
             print(
                 f"Epoch {epoch} complete, loss {loss:.4f}, smoothed loss {smoothed_loss:.4f}"
             )
-            break
     except KeyboardInterrupt:
         return params, opt_state
     return params, opt_state
