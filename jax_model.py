@@ -100,7 +100,9 @@ class LM(fnn.Module):
         )
         rng = self.make_rng("token_sampling")
         chosen_tokens = []
-        predict = jax.jit(self.__call__)
+        # On my machine with Python 3.9, jax.jit(self.__call__) works, but it's
+        # broken on Colab with Python 3.7.
+        predict = jax.jit(lambda text: self(text))
         for i in range(prompt_tokens, self.cfg.seq_len):
             unnorm_log_probs = predict(text=tokens)[i, :]
             sorted_indices = jnp.argsort(unnorm_log_probs)[::-1]
