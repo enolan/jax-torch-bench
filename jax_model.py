@@ -196,6 +196,7 @@ def train_loop(
                         )
                         if idx % 1000 == 0:
                             print(f"At step {idx}, smoothed loss {smoothed_loss:.4f}")
+                            save_model(params, opt_state, "jax_model.pkl")
                     params, opt_state, loss, rng = fast_train_step(
                         opt_state, params, batch, rng
                     )
@@ -218,9 +219,11 @@ def save_model(params, opt_state, name):
     with open(name, "wb") as f:
         pickle.dump((params, opt_state), f)
 
+
 def load_model(name):
     with open(name, "rb") as f:
         return pickle.load(f)
+
 
 if __name__ == "__main__":
     params, model, optimizer, opt_state = setup_all()
