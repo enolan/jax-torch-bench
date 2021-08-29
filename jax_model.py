@@ -158,27 +158,43 @@ def train_loop(
         else jax.random.PRNGKey(random.randrange(-(2 ** 63), 2 ** 63))
     )
 
-    def run_train_step(opt_state, params, text_batch, rng):
+    devices = jax.local_device_count()
+    assert cfg.batch_size % devices == 0
+    batch_size_per_device = cfg.batch_size // devices
+    print(
+        f"Running with batch size {cfg.batch_size} on {devices} devices, {batch_size_per_device} each."
+    )
+
+    def run_train_step_inner(opt_state, params, rng, text_batch_inner):
         rng, rng2 = jax.random.split(rng)
         loss, grad = jax.value_and_grad(
             lambda p: jax.vmap(
                 lambda text: compute_loss(p, model, text=text, rng=rng),
                 in_axes=0,
                 out_axes=0,
-            )(text_batch).mean()
+            )(text_batch_inner).mean()
         )(params)
-        updates, opt_state = optimizer.update(grad, opt_state)
+        collective_loss = jax.lax.pmean(loss, axis_name="batch_inner")
+        collective_grad = jax.lax.pmean(grad, axis_name="batch_inner")
+        updates, opt_state = optimizer.update(collective_grad, opt_state)
         params = optax.apply_updates(params, updates)
-        return params, opt_state, loss, rng2
+        return params, opt_state, collective_loss
 
-    fast_train_step = jax.jit(run_train_step, donate_argnums=[0, 1, 3])
+    parallel_train_step = jax.pmap(
+        run_train_step_inner,
+        axis_name="batch_inner",
+        donate_argnums=[0, 1, 2, 3],
+        in_axes=(None, None, 0, 0),
+        out_axes=(None, None, None),
+    )
     # warm with dummy iter
     print("JITting...", end="", flush=True)
-    params, opt_state, loss, rng = fast_train_step(
+    rngs = jax.random.split(rng, devices)
+    params, opt_state, loss = parallel_train_step(
         opt_state,
         params,
-        jnp.zeros([cfg.batch_size, cfg.seq_len], dtype=jnp.uint8),
-        rng,
+        rngs,
+        jnp.zeros([devices, batch_size_per_device, cfg.seq_len], dtype=jnp.uint8),
     )
     print(" done.")
 
@@ -187,10 +203,15 @@ def train_loop(
     try:
         for epoch in itertools.count():
             with tqdm(
-                list(Enwik9Loader(cfg.batch_size, cfg.seq_len, datapath)), leave=False
+                list(Enwik9Loader(cfg.batch_size, cfg.seq_len, datapath)),
+                leave=False,
             ) as pbar:
                 for idx, batch in enumerate(pbar):
-                    batch = jnp.array(batch)
+                    batch = jnp.array(batch).reshape(
+                        [devices, batch_size_per_device, cfg.seq_len]
+                    )
+                    rngs = jax.random.split(rng, devices + 1)
+                    rng = rngs[0]
                     if loss is not None:
                         smoothed_loss = ewma.update_ewma(loss)
                         pbar.set_postfix(
@@ -199,8 +220,8 @@ def train_loop(
                         if idx % 1000 == 0:
                             print(f"At step {idx}, smoothed loss {smoothed_loss:.4f}")
                             save_model(params, opt_state, "jax_model.pkl")
-                    params, opt_state, loss, rng = fast_train_step(
-                        opt_state, params, batch, rng
+                    params, opt_state, loss = parallel_train_step(
+                        opt_state, params, rngs[1:], batch
                     )
             print(
                 f"Epoch {epoch} complete, loss {loss:.4f}, smoothed loss {smoothed_loss:.4f}"
