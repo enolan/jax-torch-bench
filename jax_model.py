@@ -7,14 +7,13 @@ import numpy as np
 import numpy.typing as npt
 import optax
 import pickle
+import random
 from tqdm import trange, tqdm
 from typing import Union
 
+from config import ModelConfig
 from data import Enwik9Loader
 from utils import ConfigurationError, EWMA, ShapeError
-
-SEQ_LEN = 256
-D_MODEL = 512
 
 
 class TransformerLayer(fnn.Module):
@@ -52,41 +51,40 @@ class TransformerLayer(fnn.Module):
 
 
 class LM(fnn.Module):
-    n_layers: int
-    d_model: int
-    num_heads: int
-    ff_dim: int
-    dropout: float
-    max_len: int
+    cfg: ModelConfig
 
     def setup(self):
-        self.byte_embedding = fnn.Embed(num_embeddings=256, features=self.d_model)
+        self.byte_embedding = fnn.Embed(num_embeddings=256, features=self.cfg.d_model)
         self.transformer_layers = [
-            TransformerLayer(self.d_model, self.num_heads, self.ff_dim, self.dropout)
-            for _ in range(self.n_layers)
+            TransformerLayer(
+                self.cfg.d_model, self.cfg.num_heads, self.cfg.ff_dim, self.cfg.dropout
+            )
+            for _ in range(self.cfg.n_layers)
         ]
         self.prob_decoder = fnn.Dense(features=256)
         self.positional_encoding = self.param(
             "positional_encoding",
             jnn.initializers.lecun_normal(),
-            (self.max_len, self.d_model),
+            (self.cfg.seq_len, self.cfg.d_model),
         )
-        self.dropout_layer = fnn.Dropout(self.dropout, deterministic=False)
+        self.dropout_layer = fnn.Dropout(self.cfg.dropout, deterministic=False)
 
     def __call__(self, text):
         "Run the model, returning unnormalized log probabilities."
         if (
             len(text.shape) != 1
-            or text.shape[0] != self.max_len
+            or text.shape[0] != self.cfg.seq_len
             or text.dtype != jnp.uint8
         ):
             raise ShapeError(
-                f"input text shape should be [{self.max_len}] with dtype uint8. Got {text.shape}, {text.dtype}"
+                f"input text shape should be [{self.cfg.seq_len}] with dtype uint8. Got {text.shape}, {text.dtype}"
             )
         input = self.byte_embedding(text)
         mask = fnn.attention.make_causal_mask(text)
         # Shift input right so causality isn't violated
-        input = jnp.concatenate([jnp.zeros([1, self.d_model]), input[:-1, :]], axis=0)
+        input = jnp.concatenate(
+            [jnp.zeros([1, self.cfg.d_model]), input[:-1, :]], axis=0
+        )
         input = input + self.positional_encoding
         input = self.dropout_layer(input)
         for tl in self.transformer_layers:
@@ -97,12 +95,13 @@ class LM(fnn.Module):
         bytes_in = jnp.array(np.frombuffer(prompt.encode("utf-8"), dtype=np.uint8))
         prompt_tokens = bytes_in.shape[0]
         tokens = jnp.concatenate(
-            [bytes_in, jnp.zeros([SEQ_LEN - prompt_tokens], dtype=jnp.uint8)], axis=0
+            [bytes_in, jnp.zeros([self.cfg.seq_len - prompt_tokens], dtype=jnp.uint8)],
+            axis=0,
         )
         rng = self.make_rng("token_sampling")
         chosen_tokens = []
         predict = jax.jit(self.__call__)
-        for i in range(prompt_tokens, SEQ_LEN):
+        for i in range(prompt_tokens, self.cfg.seq_len):
             unnorm_log_probs = predict(text=tokens)[i, :]
             sorted_indices = jnp.argsort(unnorm_log_probs)[::-1]
             cumulative_probs = jnp.cumsum(jnn.softmax(unnorm_log_probs[sorted_indices]))
@@ -125,39 +124,38 @@ class LM(fnn.Module):
         return prompt + bytes(chosen_tokens).decode("utf-8")
 
 
-def compute_loss(params, model, text, rng):
+def compute_loss(params, model: LM, text, rng):
     model_out = model.apply(params, text=text, rngs={"dropout": rng})
     one_hots = jnn.one_hot(text, 256)
     loss = optax.softmax_cross_entropy(model_out, one_hots)
     return loss
 
 
-def setup_model(rng):
-    model = LM(
-        n_layers=12,
-        d_model=D_MODEL,
-        num_heads=8,
-        ff_dim=3072,
-        dropout=0.1,
-        max_len=SEQ_LEN,
-    )
+def setup_model(rng, cfg: ModelConfig):
+    model = LM(cfg)
 
     rng_p, rng_d = jax.random.split(rng)
     params = model.init(
-        {"params": rng_p, "dropout": rng_d}, jnp.zeros([SEQ_LEN], dtype=jnp.uint8)
+        {"params": rng_p, "dropout": rng_d}, jnp.zeros([cfg.seq_len], dtype=jnp.uint8)
     )
     return params, model
 
 
-def setup_optimizer(params):
-    optimizer = optax.adam(1e-3)
+def setup_optimizer(params, cfg: ModelConfig):
+    optimizer = optax.adam(cfg.learning_rate)
     opt_state = optimizer.init(params)
     return optimizer, opt_state
 
 
 def train_loop(
-    model, optimizer, opt_state, params, batch_size, rng=None, n_epochs=None
+    model: LM, optimizer, opt_state, params, cfg: ModelConfig, datapath: str, rng=None
 ):
+    rng = (
+        rng
+        if rng is not None
+        else jax.random.PRNGKey(random.randrange(-(2 ** 63), 2 ** 63))
+    )
+
     def run_train_step(opt_state, params, text_batch, rng):
         rng, rng2 = jax.random.split(rng)
         loss, grad = jax.value_and_grad(
@@ -177,7 +175,7 @@ def train_loop(
     params, opt_state, loss, rng = fast_train_step(
         opt_state,
         params,
-        jnp.zeros([batch_size, SEQ_LEN], dtype=jnp.uint8),
+        jnp.zeros([cfg.batch_size, cfg.seq_len], dtype=jnp.uint8),
         rng,
     )
     print(" done.")
@@ -186,7 +184,9 @@ def train_loop(
     loss = None
     try:
         for epoch in itertools.count():
-            with tqdm(list(Enwik9Loader(batch_size, SEQ_LEN)), leave=False) as pbar:
+            with tqdm(
+                list(Enwik9Loader(cfg.batch_size, cfg.seq_len, datapath)), leave=False
+            ) as pbar:
                 for idx, batch in enumerate(pbar):
                     batch = jnp.array(batch)
                     if loss is not None:
@@ -209,10 +209,28 @@ def train_loop(
     return params, opt_state
 
 
-def setup_all():
-    params, model = setup_model(jax.random.PRNGKey(11))
-    optimizer, opt_state = setup_optimizer(params)
-    return params, model, optimizer, opt_state
+def setup_all(cfg: ModelConfig, rng=None):
+    rng = (
+        rng
+        if rng is not None
+        else jax.random.PRNGKey(random.randrange(-(2 ** 63), 2 ** 63))
+    )
+
+    params, model = setup_model(rng, cfg)
+    optimizer, opt_state = setup_optimizer(params, cfg)
+
+    def sample(params, prompt):
+        rng_d, rng_s = jax.random.split(
+            jax.random.PRNGKey(random.randrange(-(2 ** 63), 2 ** 63))
+        )
+        return model.apply(
+            params,
+            prompt,
+            rngs={"dropout": rng_d, "token_sampling": rng_s},
+            method=LM.sample,
+        )
+
+    return params, model, optimizer, opt_state, sample
 
 
 def save_model(params, opt_state, name):
@@ -223,10 +241,3 @@ def save_model(params, opt_state, name):
 def load_model(name):
     with open(name, "rb") as f:
         return pickle.load(f)
-
-
-if __name__ == "__main__":
-    params, model, optimizer, opt_state = setup_all()
-    params, opt_state = train_loop(
-        model, optimizer, opt_state, params, 32, rng=jax.random.PRNGKey(0)
-    )

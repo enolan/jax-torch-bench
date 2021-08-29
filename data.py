@@ -7,8 +7,8 @@ from typing import Any
 class Enwik9Loader:
     """Iterator that returns shuffled slices of Enwik9"""
 
-    def __init__(self, batch_size: int, seq_len: int):
-        self.arr = np.fromfile("/home/enolan/junk/enwik9", dtype=np.uint8)
+    def __init__(self, batch_size: int, seq_len: int, datapath: str):
+        self.arr = np.fromfile(datapath, dtype=np.uint8)
         self.batch_size = batch_size
         self.seq_len = seq_len
 

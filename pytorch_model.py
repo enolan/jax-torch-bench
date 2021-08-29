@@ -5,30 +5,35 @@ import torch.nn as nn
 from tqdm import tqdm
 from typing import Optional
 
+from config import ModelConfig
 from data import Enwik9Loader
 from utils import EWMA
 
 
 class LM(nn.Module):
-    def __init__(self, seq_len, d_model, n_layers, num_heads, ff_dim):
+    def __init__(self, cfg: ModelConfig):
         super().__init__()
 
-        self.d_model = d_model
-        self.seq_len = seq_len
+        self.cfg = cfg
 
         self.register_parameter(
-            "positional_encoding", nn.Parameter(torch.empty(seq_len, d_model))
+            "positional_encoding", nn.Parameter(torch.empty(cfg.seq_len, cfg.d_model))
         )
         nn.init.normal_(self.positional_encoding)
 
-        self.byte_embedding = nn.Embedding(num_embeddings=256, embedding_dim=d_model)
+        self.byte_embedding = nn.Embedding(
+            num_embeddings=256, embedding_dim=cfg.d_model
+        )
         t_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=num_heads, dim_feedforward=ff_dim, batch_first=True
+            d_model=cfg.d_model,
+            nhead=cfg.num_heads,
+            dim_feedforward=cfg.ff_dim,
+            batch_first=True,
         )
         self.transformer = nn.TransformerEncoder(
-            encoder_layer=t_layer, num_layers=n_layers
+            encoder_layer=t_layer, num_layers=cfg.n_layers
         )
-        self.prob_decoder = nn.Linear(in_features=d_model, out_features=256)
+        self.prob_decoder = nn.Linear(in_features=cfg.d_model, out_features=256)
 
     def forward(self, text_batch):
         batch_size = text_batch.shape[0]
@@ -36,24 +41,26 @@ class LM(nn.Module):
         embeddings = self.byte_embedding(text_batch.int())
         embeddings = torch.cat(
             [
-                torch.zeros(batch_size, 1, self.d_model, device=text_batch.device),
+                torch.zeros(batch_size, 1, self.cfg.d_model, device=text_batch.device),
                 embeddings[:, :-1, :],
             ],
             axis=1,
         )
-        embeddings = nn.Dropout(p=0.1)(embeddings + self.positional_encoding)
+        embeddings = nn.Dropout(p=self.cfg.dropout)(
+            embeddings + self.positional_encoding
+        )
         output_probabilities = self.prob_decoder(
             self.transformer(
                 embeddings,
                 mask=nn.Transformer.generate_square_subsequent_mask(
-                    None, self.seq_len
+                    None, self.cfg.seq_len
                 ).to(embeddings),
             )
         )
         return output_probabilities
 
     def sample(self, prompt: str, top_p: float = 0.95) -> str:
-        assert len(prompt) < self.seq_len
+        assert len(prompt) < self.cfg.seq_len
         prompt_bytes = prompt.encode("utf-8")
         input = torch.cat(
             [
@@ -62,14 +69,14 @@ class LM(nn.Module):
                 )[None, :],
                 torch.zeros(
                     1,
-                    self.seq_len - len(prompt_bytes),
+                    self.cfg.seq_len - len(prompt_bytes),
                     dtype=torch.uint8,
                     device="cuda",
                 ),
             ],
             dim=1,
         )
-        for i in range(len(prompt_bytes), self.seq_len):
+        for i in range(len(prompt_bytes), self.cfg.seq_len):
             out_probs = self(input)[0][i]
             sorted_probs, sorted_indices = out_probs.sort(descending=True)
             cumulative_probs = sorted_probs.softmax(0).cumsum(0)
@@ -100,16 +107,19 @@ def compute_loss(lm, batch):
 optimizer: Optional[torch.optim.Optimizer] = None
 
 
-def train_loop(lm: LM, batch_size: int, seq_len: int) -> None:
+def train_loop(lm: LM, cfg: ModelConfig, datapath: str) -> None:
     global optimizer
     optimizer = (
-        torch.optim.Adam(lm.parameters(), 1e-4) if optimizer is None else optimizer
+        torch.optim.Adam(lm.parameters(), cfg.learning_rate)
+        if optimizer is None
+        else optimizer
     )
     ewma = EWMA(0.99)
     try:
         for epoch in itertools.count():
             with tqdm(
-                list(enumerate(Enwik9Loader(batch_size, seq_len))), leave=False
+                list(enumerate(Enwik9Loader(cfg.batch_size, cfg.seq_len, datapath))),
+                leave=False,
             ) as pbar:
                 for i, batch in pbar:
                     loss = compute_loss(lm, torch.tensor(batch, device="cuda"))
