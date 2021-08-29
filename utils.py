@@ -16,7 +16,7 @@ class EWMA:
         self.alpha = 1 - smoothing_factor
         self.average: Optional[float] = None
 
-    def update_ewma(self, new_value: float):
+    def update_ewma(self, new_value: float) -> float:
         if self.average is not None:
             self.average = self.alpha * new_value + (1 - self.alpha) * self.average
         else:
