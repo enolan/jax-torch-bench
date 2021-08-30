@@ -207,9 +207,11 @@ def train_loop(
                 leave=False,
             ) as pbar:
                 for idx, batch in enumerate(pbar):
-                    batch = jnp.array(batch).reshape(
+                    batch = batch.reshape(
                         [devices, batch_size_per_device, cfg.seq_len]
                     )
+                    batch = [batch[i] for i in range(devices)]
+                    batch = jax.device_put_sharded(batch, devices=jax.local_devices())
                     rngs = jax.random.split(rng, devices + 1)
                     rng = rngs[0]
                     if loss is not None:
