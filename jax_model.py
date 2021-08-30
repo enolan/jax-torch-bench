@@ -187,16 +187,6 @@ def train_loop(
         in_axes=(None, None, 0, 0),
         out_axes=(None, None, None),
     )
-    # warm with dummy iter
-    print("JITting...", end="", flush=True)
-    rngs = jax.random.split(rng, devices)
-    params, opt_state, loss = parallel_train_step(
-        opt_state,
-        params,
-        rngs,
-        jnp.zeros([devices, batch_size_per_device, cfg.seq_len], dtype=jnp.uint8),
-    )
-    print(" done.")
 
     ewma = EWMA(smoothing_factor=0.99)
     loss = None
