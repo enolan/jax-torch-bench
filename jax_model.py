@@ -172,15 +172,6 @@ def train_loop(
         return params, opt_state, loss, rng2
 
     fast_train_step = jax.jit(run_train_step, donate_argnums=[0, 1, 3])
-    # warm with dummy iter
-    print("JITting...", end="", flush=True)
-    params, opt_state, loss, rng = fast_train_step(
-        opt_state,
-        params,
-        jnp.zeros([cfg.batch_size, cfg.seq_len], dtype=jnp.uint8),
-        rng,
-    )
-    print(" done.")
 
     ewma = EWMA(smoothing_factor=0.99)
     loss = None
